@@ -1,0 +1,291 @@
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import cv2
+import numpy as np
+from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# ----------------- 모듈 정의 (Modules Definition) -----------------
+
+# ConvBlock: 기본 블록 (2개의 Conv-BN-ReLU 시퀀스)
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.block(x)
+
+# DPFFB (Deep Parallel Feature Fusion Block)
+class DPFFB(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # 논문에서는 두 브랜치가 동일하므로 out_channels을 절반으로 나눠 각 브랜치에 할당
+        branch_channels = out_channels // 2
+        self.upper = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(branch_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.lower = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(branch_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        up = self.upper(x)
+        low = self.lower(x)
+        # 두 브랜치의 결과를 채널 축으로 합침
+        return torch.cat([up, low], dim=1)
+
+# SEBlock (Squeeze-and-Excitation)
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=2): # 논문에 따라 reduction ratio r=2
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        # 논문은 FC layer 대신 1x1 Conv를 사용했으므로 이를 따름
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, kernel_size=1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1, padding=0, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        weight = self.fc(self.pool(x))
+        return x * weight
+
+# BlurPool: Anti-aliasing 다운샘플링
+class BlurPool(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        # 가우시안 블러와 유사한 3x3 필터 정의 (low-pass filter)
+        kernel = torch.tensor([[1., 2., 1.], [2., 4., 2.], [1., 2., 1.]])
+        kernel = kernel / kernel.sum()
+        self.register_buffer('filter', kernel[None, None, :, :].repeat(channels, 1, 1, 1))
+        self.channels = channels
+    def forward(self, x):
+        # stride=2를 가진 컨볼루션을 통해 블러링과 다운샘플링을 동시에 수행
+        return F.conv2d(x, self.filter, stride=2, padding=1, groups=self.channels)
+
+# ----------------- HC-Unet++ 메인 구조 (Main Architecture) -----------------
+
+class HCUnetPlusPlus(nn.Module):
+    """
+    HC-Unet++ 모델의 완전한 구현.
+    논문의 Figure 2a 다이어그램에 나타난 중첩 U-Net 구조를 따름.
+    X_i,j는 i-번째 다운샘플링 레벨의 j-번째 컨볼루션 블록을 의미.
+    """
+    def __init__(self, in_channels=3, num_classes=1, base_c=64):
+        super().__init__()
+        
+        filters = [base_c, base_c*2, base_c*4, base_c*8, base_c*16]
+
+        # Downsampling (BlurPool)
+        self.pool0 = BlurPool(filters[0])
+        self.pool1 = BlurPool(filters[1])
+        self.pool2 = BlurPool(filters[2])
+        self.pool3 = BlurPool(filters[3])
+
+        # Upsampling
+        self.up1_0 = nn.ConvTranspose2d(filters[1], filters[0], 2, stride=2)
+        self.up2_0 = nn.ConvTranspose2d(filters[2], filters[1], 2, stride=2)
+        self.up3_0 = nn.ConvTranspose2d(filters[3], filters[2], 2, stride=2)
+        self.up4_0 = nn.ConvTranspose2d(filters[4], filters[3], 2, stride=2)
+
+        self.up1_1 = nn.ConvTranspose2d(filters[1], filters[0], 2, stride=2)
+        self.up2_1 = nn.ConvTranspose2d(filters[2], filters[1], 2, stride=2)
+        self.up3_1 = nn.ConvTranspose2d(filters[3], filters[2], 2, stride=2)
+        
+        self.up1_2 = nn.ConvTranspose2d(filters[1], filters[0], 2, stride=2)
+        self.up2_2 = nn.ConvTranspose2d(filters[2], filters[1], 2, stride=2)
+
+        self.up1_3 = nn.ConvTranspose2d(filters[1], filters[0], 2, stride=2)
+
+        # Encoder (X_i,0)
+        self.conv0_0 = ConvBlock(in_channels, filters[0])
+        self.conv1_0 = ConvBlock(filters[0], filters[1])
+        self.conv2_0 = ConvBlock(filters[1], filters[2])
+        self.conv3_0 = ConvBlock(filters[2], filters[3])
+        # Bottleneck (X_4,0) - DPFFB 적용
+        #self.conv4_0 = DPFFB(filters[3], filters[4])
+        self.conv4_0 = ConvBlock(filters[3], filters[4])
+
+
+        # Nested Skip Path 1 (X_i,1)
+        self.conv0_1 = ConvBlock(filters[0] + filters[0], filters[0])
+        self.conv1_1 = ConvBlock(filters[1] + filters[1], filters[1])
+        self.conv2_1 = ConvBlock(filters[2] + filters[2], filters[2])
+        self.conv3_1 = ConvBlock(filters[3] + filters[3], filters[3]) # From DPFFB. 512 + 512 = 1024 로 수정
+
+
+
+        # Nested Skip Path 2 (X_i,2)
+        self.conv0_2 = ConvBlock(filters[0]*2 + filters[0], filters[0])
+        self.conv1_2 = ConvBlock(filters[1]*2 + filters[1], filters[1])
+        self.conv2_2 = ConvBlock(filters[2]*2 + filters[2], filters[2])
+        # SEBlock 적용
+        self.se2_2 = SEBlock(filters[2])
+        
+        # Nested Skip Path 3 (X_i,3)
+        self.conv0_3 = ConvBlock(filters[0]*3 + filters[0], filters[0])
+        self.conv1_3 = ConvBlock(filters[1]*3 + filters[1], filters[1])
+        
+        # Nested Skip Path 4 (X_i,4)
+        self.conv0_4 = ConvBlock(filters[0]*4 + filters[0], filters[0])
+        
+        # Final Layer
+        self.final = nn.Conv2d(filters[0], num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder (X_i,0)
+        x0_0 = self.conv0_0(x)
+        x1_0 = self.conv1_0(self.pool0(x0_0))
+        x2_0 = self.conv2_0(self.pool1(x1_0))
+        x3_0 = self.conv3_0(self.pool2(x2_0))
+        x4_0 = self.conv4_0(self.pool3(x3_0))
+
+        # Skip Path j=1
+        x0_1 = self.conv0_1(torch.cat([x0_0, self.up1_0(x1_0)], 1))
+        x1_1 = self.conv1_1(torch.cat([x1_0, self.up2_0(x2_0)], 1))
+        x2_1 = self.conv2_1(torch.cat([x2_0, self.up3_0(x3_0)], 1))
+        x3_1 = self.conv3_1(torch.cat([x3_0, self.up4_0(x4_0)], 1))
+
+        # Skip Path j=2
+        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up1_1(x1_1)], 1))
+        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up2_1(x2_1)], 1))
+        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self.up3_1(x3_1)], 1))
+        x2_2 = self.se2_2(x2_2) # Apply SEBlock as per diagram
+
+        # Skip Path j=3
+        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up1_2(x1_2)], 1))
+        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self.up2_2(x2_2)], 1))
+
+        # Skip Path j=4
+        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self.up1_3(x1_3)], 1))
+        
+        output = self.final(x0_4)
+        return output
+
+# ----------------- 데이터셋 (Dataset) -----------------
+
+class CrackDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.images = sorted([f for f in os.listdir(root_dir) if f.endswith('.jpg')])
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_name = self.images[idx]
+        img_path = os.path.join(self.root_dir, img_name)
+        mask_path = img_path.replace('.jpg', '.png')
+
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        # 픽셀 값이 0 또는 255라면, 127보다 큰 값으로 이진화
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        mask = mask / 255.0 # 0 또는 1로 정규화
+        mask = mask.astype('float32')
+
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask'].unsqueeze(0) # 채널 차원 추가 (H, W) -> (1, H, W)
+
+        return image, mask
+
+# ----------------- 학습 루프 (Training Loop) -----------------
+
+def train():
+    # 하이퍼파라미터 설정
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ROOT_PATH = "/mnt/storage/chaeyoung/crack_seg_datasets" 
+    SAVE_PATH_DIR = "/mnt/storage/chaeyoung/saved_models" # 저장할 디렉토리 경로
+    LEARNING_RATE = 1e-4
+    BATCH_SIZE = 4 
+    NUM_EPOCHS = 50
+    NUM_WORKERS = 4
+    # 논문은 512x512를 사용했으나 데이터셋에 맞추어 조절
+    IMAGE_HEIGHT = 384
+    IMAGE_WIDTH = 640
+
+    os.makedirs(SAVE_PATH_DIR, exist_ok=True)
+    
+    print(f"Using device: {DEVICE}")
+    print(f"Models will be saved to: {SAVE_PATH_DIR}")
+
+
+    # 데이터 증강 및 전처리
+    transform = A.Compose([
+        A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        #A.RandomRotate90(p=0.5), 이미지 정사각형인 경우에만 사용 가능
+        A.Rotate(limit=15, p=0.5),
+        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)), # [-1, 1] 범위로 정규화
+        ToTensorV2(),
+    ])
+
+    dataset = CrackDataset(root_dir=ROOT_PATH, transform=transform)
+    loader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=NUM_WORKERS,
+        pin_memory=True # GPU 사용 시 데이터 로딩 속도 향상
+    )
+
+    model = HCUnetPlusPlus(in_channels=3, num_classes=1).to(DEVICE)
+    # Binary Cross Entropy with Logits Loss (sigmoid가 모델 마지막에 없음)
+    loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        loop = tqdm(loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        total_loss = 0
+        
+        for images, masks in loop:
+            images = images.to(device=DEVICE)
+            masks = masks.to(device=DEVICE)
+            
+            # Forward
+            preds = model(images)
+            loss = loss_fn(preds, masks)
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+
+        avg_loss = total_loss / len(loader)
+        print(f"----> Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+
+    # 지정 경로에 모델 저장
+    final_model_path = os.path.join(SAVE_PATH_DIR, "hc_unetpp_crack_v2.pth")
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Final model saved to {final_model_path}")
+
+
+if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
+    train()
